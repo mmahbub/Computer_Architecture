@@ -53,6 +53,8 @@ class Config:
                 self.len_fp_div = value
             i += 1
 
+        assert int(self.num_reorder) <= 10, "too many entries for the reorder buffer"       
+
     def print_config(self):
         print("Configuration")
         print("-------------")
@@ -245,17 +247,19 @@ class RegisterStatus:
         self.renames = list()
         self.spot_locator = Dictlist()
         self.spot_remover = Dictlist()
+        self.res_locator = Dictlist()
         self.config = config
         self.ins = ins
 
         for i in range(0, int(self.config.num_reorder)+5):
             self.renames.append(-1)
             
-    def find_spot(self, reg):
+    def find_spot(self, reg, iss):
         x = 0 
         for i in self.renames:
             if i == -1:
                 self.spot_locator[reg] = x
+                self.res_locator[reg, iss] = x
                 self.spot_remover[reg] = x
                 self.renames[x] = reg
                 return x
@@ -276,10 +280,10 @@ class RegisterStatus:
                     return v[-1]
         return False
 
-    def check_in_for_reset(self, reg):
-        for k, v in self.spot_locator.items():
+    def check_in_for_reset(self, reg, iss):
+        for k, v in self.res_locator.items():
             if v:
-                if k == reg:
+                if (k[0] == reg and k[1] == iss):
                     x = v[0]
                     v.pop(0)
                     return x
@@ -418,7 +422,7 @@ class Stations:
             x+=1
         return False
 
-    def find_spot(self, ins):
+    def find_spot(self, ins, cycle):
         for x in range(len(self.stations)):
             i = self.stations[x]
             if ins.ins == "sub" or ins.ins == "add":
@@ -432,7 +436,7 @@ class Stations:
                         rt = ins.arg2
                         if self.check_oj(rt,x):
                             i.qk = self.status.check_in(rt)
-                        dest = self.status.find_spot(ins.dest)
+                        dest = self.status.find_spot(ins.dest,cycle)
                         i.dest = dest
                         return True, x
                     
@@ -447,7 +451,7 @@ class Stations:
                         rt = ins.arg2
                         if self.check_oj(rt,x):
                             i.qk = self.status.check_in(rt)
-                        dest = self.status.find_spot(ins.dest)
+                        dest = self.status.find_spot(ins.dest,cycle)
                         i.dest = dest
                         return True, x
 
@@ -462,7 +466,7 @@ class Stations:
                         rt = ins.arg2
                         if self.check_oj(rt,x):
                             i.qk = self.status.check_in(rt)
-                        dest = self.status.find_spot(ins.dest)
+                        dest = self.status.find_spot(ins.dest,cycle)
                         i.dest = dest
                         return True, x
 
@@ -472,7 +476,7 @@ class Stations:
                     if i.type == "effaddr":
                         i.busy = "yes"
                         i.op = ins.ins
-                        dest = self.status.find_spot(ins.dest)
+                        dest = self.status.find_spot(ins.dest,cycle)
                         i.dest = dest
                         if self.check_oj(ins.reg,x):
                             i.qj = self.status.check_in(ins.reg)                        
@@ -534,7 +538,8 @@ class Pipeline:
             if i.status == "issued":
                 station = self.stations.stations[i.res]
                 i.obj.start_executing = self.cycle
-                if (i.obj.ins == "fsw" or i.obj.ins == "sw"):
+                if ((i.obj.ins == "fsw" or i.obj.ins == "sw") and
+                      station.qj == ""):
                     i.status = "executing"
                     i.cycles_left = i.cycles_left - 1
                 elif ((i.obj.ins == "flw" or i.obj.ins == "lw") and
@@ -566,7 +571,7 @@ class Pipeline:
                     else:
                         self.write_queue.append(i)
                          
-    def check_store(self, val):
+    def check_store(self, val, count):
         q = []
         for buff in self.buff.entries:
             if buff.busy == 'yes':
@@ -586,30 +591,34 @@ class Pipeline:
             elif (q[i].obj.ins == 'flw' or q[i].obj.ins == 'lw'): 
                 ls_ins.append(q[i].obj.ins)
                 ls_add.append(q[i].obj.addr)
+                
+        d = defaultdict(list)
+        for index, e in enumerate(ls_ins):
+            d[e].append(index)
         
         if (('flw' in ls_ins or 'lw' in ls_ins) and self.memaccess):
-            self.data_conflicts += 1
+            if count:
+                self.data_conflicts += 1
             return False
         
         elif (('fsw' in ls_ins and ls_ins.index('fsw') == 0) or
-          ('sw' in ls_ins and ls_ins.index('sw') == 0)):
+              ('sw' in ls_ins and ls_ins.index('sw') == 0)):
           
             if ('fsw' in ls_ins and 
                 ls_ins.index(val.obj.ins) > ls_ins.index('fsw')):
-                ld_in = ls_ins.index(val.obj.ins)
-                sd_in = ls_ins.index('fsw')           
-                if (ls_add[ld_in] == ls_add[sd_in]):
-                    self.true_dependence += 1
+                sd_in = max(d['fsw']) 
+                if (val.obj.addr == ls_add[sd_in]):
+                    if count:
+                        self.true_dependence += 1
                     return False
 
             elif ('sw' in ls_ins and 
                   ls_ins.index(val.obj.ins) > ls_ins.index('sw')):
-                ld_in = ls_ins.index(val.obj.ins)
-                sd_in = ls_ins.index('sw')           
-                if (ls_add[ld_in] == ls_add[sd_in]):
-                    self.true_dependence += 1
+                sd_in = max(d['sw'])         
+                if (val.obj.addr == ls_add[sd_in]):
+                    if count:
+                        self.true_dependence += 1
                     return False
-
         return True
 
     def read_stage(self):
@@ -622,12 +631,14 @@ class Pipeline:
                     
         if len(self.read_queue) > 0:
             self.read_queue.sort(key= lambda x: x.obj.issues_at)
-            val = self.read_queue[0]
-            if self.check_store(val):
-                val.status = "memread"
-                val.obj.memory_read = self.cycle
-                self.write_queue.append(val)
-                self.read_queue.pop(0)
+            count = True
+            for val in self.read_queue:
+                if self.check_store(val,count):
+                    val.status = "memread"
+                    val.obj.memory_read = self.cycle
+                    self.write_queue.append(val)
+                    self.read_queue.remove(val)  
+                count = False
                 
     def write_stage(self):
         if len(self.write_queue) > 0:
@@ -635,7 +646,7 @@ class Pipeline:
             val = self.write_queue.pop(0)
             val.status = "wroteresult"
             val.obj.writes_result = self.cycle
-            dest = self.status.check_in_for_reset(val.dest)
+            dest = self.status.check_in_for_reset(val.dest, val.obj.issues_at)
             self.reset_list.append(dest)
             station = self.stations.stations[val.res]
             station.reset()
@@ -645,7 +656,7 @@ class Pipeline:
         if len(self.store_queue) > 0:
             self.store_queue.sort(key= lambda x: x.obj.issues_at)
             val = self.store_queue.pop(0)
-            dest = self.status.check_in_for_reset(val.dest)
+            dest = self.status.check_in_for_reset(val.dest, val.obj.issues_at)
             self.reset_list.append(dest)
             station = self.stations.stations[val.res]
             station.reset()
@@ -653,7 +664,7 @@ class Pipeline:
         if len(self.branch_queue) > 0:
             self.branch_queue.sort(key= lambda x: x.obj.issues_at)
             val = self.branch_queue.pop(0)
-            dest = self.status.check_in_for_reset(val.dest)
+            dest = self.status.check_in_for_reset(val.dest, val.obj.issues_at)
             self.reset_list.append(dest)
             station = self.stations.stations[val.res]
             station.reset()
@@ -711,7 +722,7 @@ class Pipeline:
             if len(stack) > 0:
                 i = stack[0]
                 if (self.buff.is_open()):
-                    res, num = self.stations.find_spot(i)
+                    res, num = self.stations.find_spot(i, self.cycle)
                     if res:
                         self.issue_instruction(i, num)
                         stack.pop(0)
